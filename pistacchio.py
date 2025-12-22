@@ -99,7 +99,7 @@ def gpioThread():
     GPIO.cleanup()
 
 def serverThread():
-  server = HTTPServer(("localhost", 8000), ApiHandler)
+  server = HTTPServer(("0.0.0.0", 8000), ApiHandler)
   print("Server avviato su http://localhost:8000")
   server.serve_forever()
   
