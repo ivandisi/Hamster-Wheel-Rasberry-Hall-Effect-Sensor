@@ -1,7 +1,8 @@
 import time
 import threading
 import json
-from queue import Queue
+from queue import LifoQueue
+from queue import Empty
 from tinydb import TinyDB, Query
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -15,7 +16,8 @@ from signal import pause
 DB_FILE = "pistacchiodbnew2.json"
 tripLength = 91
 Digital_PIN = 22
-MIN_GIRO_DT = 0.01 
+MIN_TRIP_DT = 0.01 
+MAX_ONE_IN = 0.2
 WATCHDOG_TIMEOUT = 30  # 60 secondi
 
 # =======================
@@ -23,7 +25,7 @@ WATCHDOG_TIMEOUT = 30  # 60 secondi
 # =======================
 db = TinyDB(DB_FILE)
 db_lock = threading.Lock()
-db_queue = Queue()
+db_queue = LifoQueue()
 stop_event = threading.Event()
 
 last_gpio_time = 0
@@ -35,23 +37,46 @@ last_db_write = 0
 sensor = Button(Digital_PIN, pull_up=True)
 
 def myCounter():
-    """Callback GPIO con debounce software"""
+    """Callback GPIO con debounce software e gestione queue non bloccante"""
     global last_gpio_time
     try:
         ts = time.time()
-        if ts - last_gpio_time < MIN_GIRO_DT:
-            return  # debounce software
+        
+        if ts - last_gpio_time < MIN_TRIP_DT:
+            return
         last_gpio_time = ts
 
-        print("Pistacchio", ts)
-
         data = datetime.fromtimestamp(ts)
-        db_queue.put({
-            'type': 'trip',
-            'time': ts,
-            'data': data.strftime("%Y%m%d"),
-            'hour': data.strftime("%H:%M")
-        })
+
+        try:
+            test = db_queue.get_nowait()
+            #print(ts - test['time'])
+            if ts - test['time'] < MAX_ONE_IN:
+                print("Removed old, Pistacchio", ts)
+                db_queue.put({
+                    'type': 'trip',
+                    'time': ts,
+                    'data': data.strftime("%Y%m%d"),
+                    'hour': data.strftime("%H:%M")
+                })
+            else:
+                db_queue.put(test)
+                print("Pistacchio", ts)
+                db_queue.put({
+                    'type': 'trip',
+                    'time': ts,
+                    'data': data.strftime("%Y%m%d"),
+                    'hour': data.strftime("%H:%M")
+                })
+        except Empty:
+            print("Empty, Pistacchio", ts)
+            db_queue.put({
+                'type': 'trip',
+                'time': ts,
+                'data': data.strftime("%Y%m%d"),
+                'hour': data.strftime("%H:%M")
+            })
+        
     except Exception as e:
         print("ERRORE GPIO:", e)
 
@@ -72,11 +97,12 @@ def dbWriterThread():
             db_queue.task_done()
         except Exception:
             pass
+        
+        time.sleep(60)
 
 # =======================
 # WATCHDOG THREADS
 # =======================
-
 def gpioWatchdogActive():
     global sensor, last_gpio_time
     while not stop_event.is_set():
@@ -246,7 +272,7 @@ def commandThread():
 # =======================
 print("[CTRL + C per terminare]")
 
-threading.Thread(target=dbWriterThread, daemon=True).start()
+#threading.Thread(target=dbWriterThread, daemon=True).start()
 threading.Thread(target=serverThread, daemon=True).start()
 threading.Thread(target=commandThread).start()
 threading.Thread(target=gpioWatchdogActive, daemon=True).start()
