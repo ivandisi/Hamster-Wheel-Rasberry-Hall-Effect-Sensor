@@ -62,4 +62,7 @@ dependencies {
     implementation("com.squareup.retrofit2:retrofit:2.9.0")
     implementation("com.squareup.retrofit2:converter-gson:2.9.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
+    implementation("io.github.boguszpawlowski.composecalendar:composecalendar:1.4.0")
+// separate artifact with utilities for working with kotlinx-datetime
+    implementation("io.github.boguszpawlowski.composecalendar:kotlinx-datetime:1.4.0")
 }

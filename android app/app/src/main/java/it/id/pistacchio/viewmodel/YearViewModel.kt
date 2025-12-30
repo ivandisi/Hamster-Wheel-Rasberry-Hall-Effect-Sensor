@@ -32,7 +32,7 @@ class YearViewModel : ViewModel() {
     fun fetchDataFromApi() {
         viewModelScope.launch {
             val result = loadData()
-            if (result.isSuccessful) {
+            if (result != null && result.isSuccessful) {
                 val data: DataByYear? = result.body()
                 if (data != null) {
 
@@ -57,10 +57,18 @@ class YearViewModel : ViewModel() {
         }
     }
 
-    suspend fun loadData(): Response<DataByYear> {
+    suspend fun loadData(): Response<DataByYear>? {
         val service = MyApi.instance
-        val byYear = service.getByYear(LocalDate.now().year.toString())
-        return byYear
+
+        try {
+            val byYear = service.getByYear(LocalDate.now().year.toString())
+            return byYear
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        return null
     }
 
 }

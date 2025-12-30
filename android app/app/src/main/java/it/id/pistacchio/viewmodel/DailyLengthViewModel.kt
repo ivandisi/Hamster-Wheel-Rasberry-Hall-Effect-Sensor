@@ -38,7 +38,7 @@ class DailyLengthViewModel : ViewModel() {
     fun fetchDataFromApi() {
         viewModelScope.launch {
             val result = loadData()
-            if (result.isSuccessful) {
+            if (result != null && result.isSuccessful) {
                 val data: DataByYear? = result.body()
                 if (data != null) {
                     _totalLength.value = 0.0F
@@ -71,14 +71,23 @@ class DailyLengthViewModel : ViewModel() {
         }
     }
 
-    suspend fun loadData(): Response<DataByYear> {
+    suspend fun loadData(): Response<DataByYear>? {
         val today = LocalDate.now()
         val formatter = DateTimeFormatter.ofPattern("yyyyMMdd")
         val formattedDate = today.format(formatter)
 
         val service = MyApi.instance
-        val byDay = service.getByDay(formattedDate)
-        return byDay
+
+        try {
+            val byDay = service.getByDay(formattedDate)
+            return byDay
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        return null
+
     }
 
 }

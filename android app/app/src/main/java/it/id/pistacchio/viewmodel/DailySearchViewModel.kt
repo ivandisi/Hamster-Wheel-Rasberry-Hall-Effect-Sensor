@@ -1,5 +1,6 @@
 package it.id.pistacchio.viewmodel
 
+import android.R
 import android.widget.Toast
 import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.ViewModel
@@ -20,20 +21,8 @@ import java.io.IOException
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 
-open class DailyViewModel : ViewModel() {
+class DailySearchViewModel : DailyViewModel() {
 
-    val _dataList = mutableStateOf<List<Bars>>(emptyList())
-    var _totalLength = mutableStateOf<Float>(0.0F)
-    var _avgTrips = mutableStateOf<Int>(0)
-    var _mostIntenseHour = mutableStateOf<Int>(0)
-    var _intMostIntenseHour = mutableStateOf<Int>(0)
-    var _speed = mutableStateOf<SpeedModel>(SpeedModel())
-    val dataList: State<List<Bars>> = _dataList
-    var totalLength: State<Float> = _totalLength
-    var avgTrips: State<Int> = _avgTrips
-    var intMostIntenseHour: State<Int> = _intMostIntenseHour
-    var mostIntenseHour: State<Int> = _mostIntenseHour
-    var speed: State<SpeedModel> = _speed
     private var totalTrip = 0
 
     init {
@@ -45,12 +34,16 @@ open class DailyViewModel : ViewModel() {
                     )
             )
         )
-        fetchDataFromApi()
+        val today = LocalDate.now()
+        val formatter = DateTimeFormatter.ofPattern("yyyyMMdd")
+        val formattedDate = today.format(formatter)
+
+        fetchDataFromApi(formattedDate)
     }
 
-    fun fetchDataFromApi() {
+    fun fetchDataFromApi(data: String) {
         viewModelScope.launch {
-            val result = loadData()
+            val result = loadData(data)
             if (result != null && result.isSuccessful) {
                 val data: DataByYear? = result.body()
                 if (data != null) {
@@ -95,17 +88,14 @@ open class DailyViewModel : ViewModel() {
 
             }
 
-            val speed = loadSpeed()
+            val speed = loadSpeed(data)
             if (speed != null && speed.isSuccessful && speed.body() != null) {
                 _speed.value = speed.body()!!
             }
         }
     }
 
-    suspend fun loadSpeed(): Response<SpeedModel>? {
-        val today = LocalDate.now()
-        val formatter = DateTimeFormatter.ofPattern("yyyyMMdd")
-        val formattedDate = today.format(formatter)
+    suspend fun loadSpeed(formattedDate: String): Response<SpeedModel>? {
 
         val service = MyApi.instance
 
@@ -120,10 +110,7 @@ open class DailyViewModel : ViewModel() {
         return null
     }
 
-    suspend fun loadData(): Response<DataByYear>? {
-        val today = LocalDate.now()
-        val formatter = DateTimeFormatter.ofPattern("yyyyMMdd")
-        val formattedDate = today.format(formatter)
+    suspend fun loadData(formattedDate: String): Response<DataByYear>? {
 
         val service = MyApi.instance
 
