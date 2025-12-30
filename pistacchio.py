@@ -1,24 +1,180 @@
 import time
 import threading
 import json
+from queue import LifoQueue
+from queue import Empty
 from tinydb import TinyDB, Query
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from gpiozero import Button
 from signal import pause
 
-db = TinyDB('pistacchiodbnew.json')
-stop_event = threading.Event()
+# =======================
+# CONFIG
+# =======================
+DB_FILE = "pistacchiodbnew2.json"
+# Length of wheel, 29cm diameter (91 circumference)
 tripLength = 91
+# Sensor PIN
 Digital_PIN = 22
+# Debouncing time 10ms
+MIN_TRIP_DT = 0.01 
+# High level filter, max 1 trip in 200ms on a 29cm diameter wheel (realistic max hamster speed)
+MAX_ONE_IN = 0.2
+# Watchdog
+WATCHDOG_TIMEOUT = 30 
 
-sensor = Button(Digital_PIN, pull_up=True, bounce_time=0.0009)
-sensor.when_pressed = lambda: myCounter()  
+# =======================
+# GLOBALS
+# =======================
+db = TinyDB(DB_FILE)
+db_lock = threading.Lock()
+db_queue = LifoQueue()
+stop_event = threading.Event()
+
+last_gpio_time = 0
+last_db_write = 0
+
+# =======================
+# GPIO
+# =======================
+sensor = Button(Digital_PIN, pull_up=True)
+
+def myCounter():
+    global last_gpio_time
+    try:
+        ts = time.time()
+        
+        if ts - last_gpio_time < MIN_TRIP_DT:
+            return
+        last_gpio_time = ts
+
+        data = datetime.fromtimestamp(ts)
+
+        try:
+            test = db_queue.get_nowait()
+            #print(ts - test['time'])
+            if ts - test['time'] < MAX_ONE_IN:
+                print("Removed old, Pistacchio", ts)
+                db_queue.put({
+                    'type': 'trip',
+                    'time': ts,
+                    'data': data.strftime("%Y%m%d"),
+                    'hour': data.strftime("%H:%M")
+                })
+            else:
+                db_queue.put(test)
+                print("Pistacchio", ts)
+                db_queue.put({
+                    'type': 'trip',
+                    'time': ts,
+                    'data': data.strftime("%Y%m%d"),
+                    'hour': data.strftime("%H:%M")
+                })
+        except Empty:
+            print("Empty, Pistacchio", ts)
+            db_queue.put({
+                'type': 'trip',
+                'time': ts,
+                'data': data.strftime("%Y%m%d"),
+                'hour': data.strftime("%H:%M")
+            })
+        
+    except Exception as e:
+        print("ERRORE GPIO:", e)
+
+sensor.when_pressed = myCounter
+
+# =======================
+# DB WRITER THREAD
+# =======================
+def dbWriterThread():
+    global last_db_write
+    print("DB writer started")
+
+    while not stop_event.is_set():
+        time.sleep(60)
+        batch = []
+        while True:
+            try:
+                item = db_queue.get_nowait()
+                batch.append(item)
+                db_queue.task_done()
+            except Empty:
+                break 
+
+        if batch:
+            with db_lock:
+                db.insert_multiple(batch)
+
+            last_db_write = time.time()
+            print(f"Writed {len(batch)} events into DB")
+            
+# =======================
+# WATCHDOG THREADS
+# =======================
+def gpioWatchdogActive():
+    global sensor, last_gpio_time
+    while not stop_event.is_set():
+        delta = time.time() - last_gpio_time
+        if delta > WATCHDOG_TIMEOUT:
+            try:
+                sensor.close()
+                time.sleep(0.1)
+                sensor = Button(Digital_PIN, pull_up=True)
+                sensor.when_pressed = myCounter
+                last_gpio_time = time.time()
+            except Exception as e:
+                print("❌ Error reset GPIO:", e)
+        time.sleep(1)  # controllo frequente
+
+def dbWatchdog():
+    while not stop_event.is_set():
+        qsize = db_queue.qsize()
+        if qsize > 100:
+            print(f"⚠️ WATCHDOG DB: queue length = {qsize}")
+        time.sleep(5)
+
+# =======================
+# DB READ FUNCTIONS
+# =======================
+def getTripsByHour(day, hour):
+    Qry = Query()
+    with db_lock:
+        data = db.search(
+            (Qry.data == day) & Qry.hour.test(lambda h: h.startswith(hour))
+        )
+    return {
+        'trips': len(data),
+        'length': len(data) * tripLength,
+        'hour': hour
+    }
+
+def getTripsByDay(day):
+    return [getTripsByHour(day, f"{h:02d}") for h in range(24)]
+
+def getTripsByMonth(req, month):
+    Qry = Query()
+    with db_lock:
+        t = db.search(Qry.data.test(lambda d: d.startswith(req)))
+    return {
+        'trips': len(t),
+        'length': len(t) * tripLength,
+        'month': month
+    }
+
+def getTripsByYear(year):
+    return [
+        getTripsByMonth(year + f"{m:02d}", f"{m:02d}")
+        for m in range(1, 13)
+    ]
 
 def getMaxSpeed(day):
     Qry = Query()
-    events = db.search((Qry.data == day))
+    with db_lock:
+        events = db.search(Qry.data == day)
+
     CIRCUMFERENCE_M = tripLength / 100
     N_LAPS = 50
     MAX_SPEED_M_S = 4.0
@@ -28,112 +184,79 @@ def getMaxSpeed(day):
     times = [e["time"] for e in events]
 
     results = []
-
     for i in range(len(times) - N_LAPS):
         dt = times[i + N_LAPS] - times[i]
-
         if dt < MIN_DT:
             continue
 
         speed = (CIRCUMFERENCE_M * N_LAPS) / dt
-
         results.append({
-            "start_index": i,
-            "dt": dt,
-            "speed_m_s": speed,
-            "speed_km_h": speed * 3.6,
-            "from_time": times[i],
-            "to_time": times[i + N_LAPS]
+            "speed": speed,
+            "speedKM": speed * 3.6,
+            "deltaT": dt
         })
 
     if not results:
-        #print("Nessuna velocità realistica trovata 🐹")
         return {'speed': "", 'speedKM': "", 'deltaT': ""}
-    else:
-        max_speed = max(results, key=lambda r: r["speed_m_s"])
 
-        #print(f"Velocità max (media su {N_LAPS} giri): "
-        #      f"{max_speed['speed_m_s']:.2f} m/s "
-        #      f"({max_speed['speed_km_h']:.2f} km/h)")
+    best = max(results, key=lambda r: r["speed"])
+    return {
+        'speed': f"{best['speed']:.2f} m/s",
+        'speedKM': f"({best['speedKM']:.2f} km/h)",
+        'deltaT': f"Deltat: {best['deltaT']:.2f} s"
+    }
 
-        #print(f"Δt: {max_speed['dt']:.2f} s")
-        return {'speed': f"{max_speed['speed_m_s']:.2f} m/s ", 'speedKM': f"({max_speed['speed_km_h']:.2f} km/h)", 'deltaT': f"Deltat: {max_speed['dt']:.2f} s"}
-
-def getTripsByYear(year):
-    arr = []
-    for number in range(1, 13):
-        n = f"{number:02d}"
-        data = getTripsByMonth(year + n, n)
-        arr.append(data)
-    return arr
-
-def getTripsByMonth(req, month):
-    Qry = Query()
-    t = db.search(Qry.data.test(lambda d: d.startswith(req)))
-    return {'trips': len(t), 'length': (len(t) * tripLength), 'month': month}
-
-def getTripsByDay(day):
-    arr = []
-    for number in range(24):
-        n = f"{number:02d}"
-        data = getTripsByHour(day, n)
-        arr.append(data)
-    return arr
-
-def getTripsByHour(day, hour):
-    Qry = Query()
-    data = db.search((Qry.data == day) & Qry.hour.test(lambda h: h.startswith(hour)))
-    return {'trips': len(data), 'length': (len(data) * tripLength), 'hour': hour}
-
-def myCounter():
-    print('Pistacchio ' + str(time.time()))
-    data = datetime.fromtimestamp(time.time())
-    db.insert({'type': 'trip', 'time': time.time(), 'data': data.strftime("%Y%m%d"), 'hour': data.strftime("%H:%M")})
-
+# =======================
+# HTTP API
+# =======================
 class ApiHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        parsed_path = urlparse(self.path)
-        path = parsed_path.path
-        params = parse_qs(parsed_path.query)
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
 
-        if path == "/getByDay":
-            day = params.get("day", [None])[0]
-            if not day:
-                self.send_response(400)
+        try:
+            if parsed.path == "/getByDay":
+                day = params.get("day", [None])[0]
+                if not day:
+                    raise ValueError("Missing 'day' parameter")
+                result = getTripsByDay(day)
+
+            elif parsed.path == "/getByYear":
+                year = params.get("year", [None])[0]
+                if not year:
+                    raise ValueError("Missing 'year' parameter")
+                result = getTripsByYear(year)
+
+            elif parsed.path == "/getMaxSpeed":
+                day = params.get("day", [None])[0]
+                if not day:
+                    raise ValueError("Missing 'day' parameter")
+                result = getMaxSpeed(day)
+
+            else:
+                self.send_response(404)
                 self.end_headers()
-                self.wfile.write(b"Parametro 'day' mancante")
                 return
-            result = getTripsByDay(day)
-        elif path == "/getMaxSpeed":
-          day = params.get("day", [None])[0]
-          if not day:
-              self.send_response(400)
-              self.end_headers()
-              self.wfile.write(b"Parametro 'day' mancante")
-              return
-          result = getMaxSpeed(day)
-        elif path == "/getByYear":
-            year = params.get("year", [None])[0]
-            if not year:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b"Parametro 'year' mancante")
-                return
-            result = getTripsByYear(year)
-        else:
-            self.send_response(404)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b"Endpoint non trovato")
-            return
+            self.wfile.write(json.dumps(result).encode())
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(result).encode())
+        except Exception as e:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(str(e).encode())
 
+    def log_message(self, *args):
+        return  # silenzia log HTTP
+
+# =======================
+# THREADS
+# =======================
 def serverThread():
-    server = HTTPServer(("0.0.0.0", 8000), ApiHandler)
-    print("Server avviato su http://localhost:8000")
+    server = ThreadingHTTPServer(("0.0.0.0", 8000), ApiHandler)
+    print("Server HTTP started on :8000")
     server.serve_forever()
 
 def commandThread():
@@ -142,35 +265,29 @@ def commandThread():
             cmd = input("Command: ").strip()
             if cmd == "q":
                 stop_event.set()
-            elif cmd == "r":
-                cmdTime = input("hour: ")
-                Qry = Query()
-                print(db.search(Qry.hour == cmdTime))
-            elif cmd == "trips":
-                cmdTime = input("date for Trips (yyyymmdd): ")
-                print(getTripsByDay(cmdTime))
-            elif cmd == "mtrips":
-                cmdTime = input("year for Trips (yyyy): ")
-                print(getTripsByYear(cmdTime))
+            elif cmd == "a":
+                with db_lock:
+                    print(db.all())
             elif cmd == "t":
                 myCounter()
-            elif cmd == "a":
-                print(db.all())
-            time.sleep(0.5)
+            time.sleep(0.3)
     except KeyboardInterrupt:
         stop_event.set()
 
-print('[CTRL + C, to stop the Script!]')
+# =======================
+# START
+# =======================
+print("[CTRL + C to end]")
 
-t0 = threading.Thread(target=serverThread, daemon=True)
-t2 = threading.Thread(target=commandThread)
-
-t0.start()
-t2.start()
+threading.Thread(target=dbWriterThread, daemon=True).start()
+threading.Thread(target=serverThread, daemon=True).start()
+threading.Thread(target=commandThread).start()
+threading.Thread(target=gpioWatchdogActive, daemon=True).start()
+threading.Thread(target=dbWatchdog, daemon=True).start()
 
 try:
-    pause() 
+    pause()
 except KeyboardInterrupt:
     stop_event.set()
 finally:
-    print("Script terminato")
+    print("Script ended")
