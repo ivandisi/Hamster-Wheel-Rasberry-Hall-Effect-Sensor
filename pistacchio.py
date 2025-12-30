@@ -14,11 +14,16 @@ from signal import pause
 # CONFIG
 # =======================
 DB_FILE = "pistacchiodbnew2.json"
+# Length of wheel, 29cm diameter (91 circumference)
 tripLength = 91
+# Sensor PIN
 Digital_PIN = 22
+# Debouncing time 10ms
 MIN_TRIP_DT = 0.01 
+# High level filter, max 1 trip in 200ms on a 29cm diameter wheel (realistic max hamster speed)
 MAX_ONE_IN = 0.2
-WATCHDOG_TIMEOUT = 30  # 60 secondi
+# Watchdog
+WATCHDOG_TIMEOUT = 30 
 
 # =======================
 # GLOBALS
@@ -37,7 +42,6 @@ last_db_write = 0
 sensor = Button(Digital_PIN, pull_up=True)
 
 def myCounter():
-    """Callback GPIO con debounce software e gestione queue non bloccante"""
     global last_gpio_time
     try:
         ts = time.time()
@@ -87,19 +91,26 @@ sensor.when_pressed = myCounter
 # =======================
 def dbWriterThread():
     global last_db_write
-    print("DB writer avviato")
-    while not stop_event.is_set():
-        try:
-            item = db_queue.get(timeout=1)
-            with db_lock:
-                db.insert(item)
-            last_db_write = time.time()
-            db_queue.task_done()
-        except Exception:
-            pass
-        
-        time.sleep(60)
+    print("DB writer started")
 
+    while not stop_event.is_set():
+        time.sleep(60)
+        batch = []
+        while True:
+            try:
+                item = db_queue.get_nowait()
+                batch.append(item)
+                db_queue.task_done()
+            except Empty:
+                break 
+
+        if batch:
+            with db_lock:
+                db.insert_multiple(batch)
+
+            last_db_write = time.time()
+            print(f"Writed {len(batch)} events into DB")
+            
 # =======================
 # WATCHDOG THREADS
 # =======================
@@ -108,25 +119,21 @@ def gpioWatchdogActive():
     while not stop_event.is_set():
         delta = time.time() - last_gpio_time
         if delta > WATCHDOG_TIMEOUT:
-            #print(f"⚠️ WATCHDOG GPIO: inattività {int(delta)}s, reset sensore...")
             try:
-                # rimuove il sensore attuale
                 sensor.close()
                 time.sleep(0.1)
-                # ricrea il sensore
                 sensor = Button(Digital_PIN, pull_up=True)
                 sensor.when_pressed = myCounter
                 last_gpio_time = time.time()
-                #print("✅ Sensore GPIO resettato correttamente")
             except Exception as e:
-                print("❌ Errore nel reset GPIO:", e)
+                print("❌ Error reset GPIO:", e)
         time.sleep(1)  # controllo frequente
 
 def dbWatchdog():
     while not stop_event.is_set():
         qsize = db_queue.qsize()
-        if qsize > 100:  # se la coda DB cresce troppo
-            print(f"⚠️ WATCHDOG DB: queue lunga = {qsize}")
+        if qsize > 100:
+            print(f"⚠️ WATCHDOG DB: queue length = {qsize}")
         time.sleep(5)
 
 # =======================
@@ -211,19 +218,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             if parsed.path == "/getByDay":
                 day = params.get("day", [None])[0]
                 if not day:
-                    raise ValueError("Parametro 'day' mancante")
+                    raise ValueError("Missing 'day' parameter")
                 result = getTripsByDay(day)
 
             elif parsed.path == "/getByYear":
                 year = params.get("year", [None])[0]
                 if not year:
-                    raise ValueError("Parametro 'year' mancante")
+                    raise ValueError("Missing 'year' parameter")
                 result = getTripsByYear(year)
 
             elif parsed.path == "/getMaxSpeed":
                 day = params.get("day", [None])[0]
                 if not day:
-                    raise ValueError("Parametro 'day' mancante")
+                    raise ValueError("Missing 'day' parameter")
                 result = getMaxSpeed(day)
 
             else:
@@ -249,7 +256,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 # =======================
 def serverThread():
     server = ThreadingHTTPServer(("0.0.0.0", 8000), ApiHandler)
-    print("Server HTTP avviato su :8000")
+    print("Server HTTP started on :8000")
     server.serve_forever()
 
 def commandThread():
@@ -270,9 +277,9 @@ def commandThread():
 # =======================
 # START
 # =======================
-print("[CTRL + C per terminare]")
+print("[CTRL + C to end]")
 
-#threading.Thread(target=dbWriterThread, daemon=True).start()
+threading.Thread(target=dbWriterThread, daemon=True).start()
 threading.Thread(target=serverThread, daemon=True).start()
 threading.Thread(target=commandThread).start()
 threading.Thread(target=gpioWatchdogActive, daemon=True).start()
@@ -283,4 +290,4 @@ try:
 except KeyboardInterrupt:
     stop_event.set()
 finally:
-    print("Script terminato")
+    print("Script ended")
