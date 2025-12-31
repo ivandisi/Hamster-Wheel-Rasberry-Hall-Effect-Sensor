@@ -2,8 +2,8 @@
 
 POC of a simple solution based on Rasberry PI with a Hall Effect Sensor to retrive metric from wheel trips 
 
-* Local Network Server with simple API SET
-* Local DB 
+* Local Server with simple API SET
+* Local Server DB 
 * Hall Effect Sensor data input
 * Android APP to read data
 
