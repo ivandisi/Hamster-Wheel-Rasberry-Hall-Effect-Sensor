@@ -8,6 +8,9 @@ import androidx.lifecycle.viewModelScope
 import ir.ehsannarmani.compose_charts.models.Bars
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.State
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import it.id.pistacchio.Constants
@@ -23,9 +26,18 @@ import java.time.format.DateTimeFormatter
 
 class DailySearchViewModel : DailyViewModel() {
 
+    var _selectedDate = mutableStateOf<LocalDate?>(null)
+    val selectedDate : State<LocalDate?> = _selectedDate
+    var _selectedDateLabel = mutableStateOf<String>("")
+    val selectedDateLabel : State<String> = _selectedDateLabel
+    val formatter = DateTimeFormatter.ofPattern("yyyy MM dd")
     private var totalTrip = 0
 
     init {
+
+        _selectedDate.value = LocalDate.now()
+        _selectedDateLabel.value = formatter.format(_selectedDate.value)
+
         _dataList.value = listOf(
             Bars(
                 "N/A",
@@ -39,6 +51,23 @@ class DailySearchViewModel : DailyViewModel() {
         val formattedDate = today.format(formatter)
 
         fetchDataFromApi(formattedDate)
+    }
+
+    fun updateSelection(dayState: LocalDate) {
+        _selectedDate.value = dayState
+        _selectedDateLabel.value =
+            "" + _selectedDate?.value + " " + _selectedDate.value?.month?.value?.let {
+                String.format("%02d", it)
+            } + " " + _selectedDate.value?.dayOfMonth?.let {
+                String.format("%02d", it)
+            }
+        fetchDataFromApi(
+            "" + _selectedDate.value?.year
+                    + _selectedDate.value?.month?.value?.let {
+                String.format("%02d", it)
+            } + _selectedDate.value?.dayOfMonth?.let {
+                String.format("%02d", it)
+            })
     }
 
     fun fetchDataFromApi(data: String) {

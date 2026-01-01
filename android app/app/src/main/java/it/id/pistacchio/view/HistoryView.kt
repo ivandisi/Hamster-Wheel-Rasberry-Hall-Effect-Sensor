@@ -29,11 +29,7 @@ import java.time.format.DateTimeFormatter
 @Composable
 fun HistoryView(viewModel: DailySearchViewModel = viewModel()) {
     val cs = rememberCalendarState()
-    var selectedDate by remember { mutableStateOf<LocalDate?>(null) }
-    selectedDate = LocalDate.now()
-    val today = LocalDate.now()
-    val formatter = DateTimeFormatter.ofPattern("yyyy MM dd")
-    var label = today.format(formatter)
+
 
     Box(modifier = Modifier.fillMaxSize()) {
 
@@ -46,23 +42,10 @@ fun HistoryView(viewModel: DailySearchViewModel = viewModel()) {
                     Box(
                         modifier = Modifier
                             .clickable {
-                                selectedDate = dayState.date
-                                label =
-                                    "" + selectedDate?.year + " " + selectedDate?.month?.value?.let {
-                                        String.format("%02d", it)
-                                    } + " " + selectedDate?.dayOfMonth?.let {
-                                        String.format("%02d", it)
-                                    }
-                                viewModel.fetchDataFromApi(
-                                    "" + selectedDate?.year
-                                            + selectedDate?.month?.value?.let {
-                                        String.format("%02d", it)
-                                    } + selectedDate?.dayOfMonth?.let {
-                                        String.format("%02d", it)
-                                    })
+                                viewModel.updateSelection(dayState.date)
                             }
                             .background(
-                                if (dayState.date == selectedDate)
+                                if (dayState.date == viewModel.selectedDate.value)
                                     Color.Gray
                                 else Color.Transparent
                             )
@@ -72,7 +55,7 @@ fun HistoryView(viewModel: DailySearchViewModel = viewModel()) {
                     }
                 })
             Text(
-                "Searching for: $label",
+                "Searching for: ${viewModel.selectedDate.value}",
                 modifier = Modifier
                     .padding(10.dp)
             )
