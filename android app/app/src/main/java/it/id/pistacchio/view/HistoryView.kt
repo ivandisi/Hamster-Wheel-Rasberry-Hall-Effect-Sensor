@@ -30,7 +30,6 @@ import java.time.format.DateTimeFormatter
 fun HistoryView(viewModel: DailySearchViewModel = viewModel()) {
     val cs = rememberCalendarState()
 
-
     Box(modifier = Modifier.fillMaxSize()) {
 
         Column {

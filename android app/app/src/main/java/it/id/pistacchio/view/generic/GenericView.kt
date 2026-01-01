@@ -78,7 +78,7 @@ fun RecapView(viewModel: DailyViewModel = viewModel()) {
                     .wrapContentHeight()
             )
             Text(
-                text = "${viewModel.avgTrips.value} trips/H",
+                text = "${viewModel.avgTrips.value} trips/h",
                 fontSize = 20.sp,
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier
