@@ -37,7 +37,7 @@ Project is based on Rasberry PI Board and AZ-Delivery KY-024 (+ magnet)
   <img src="https://github.com/ivandisi/Hamster-Wheel-Rasberry-Hall-Effect-Sensor/blob/main/other/example.jpg" height="200">
 </p>
 
-(In my case I modded the sensor for a better fit)
+<p align="center" >(In my case I modded the sensor for a better fit)</p>
 
 ## How to run
 
