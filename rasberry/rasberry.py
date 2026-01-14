@@ -9,11 +9,12 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from gpiozero import Button
 from signal import pause
+import sqlite3
 
 # =======================
 # CONFIG
 # =======================
-DB_FILE = "pistacchiodbnew2.json"
+DB_FILE = "pistacchio.db"
 # Length of wheel, 28cm diameter (88 circumference)
 tripLength = 88
 # Sensor PIN
@@ -28,7 +29,10 @@ WATCHDOG_TIMEOUT = 30
 # =======================
 # GLOBALS
 # =======================
-db = TinyDB(DB_FILE)
+
+con = sqlite3.connect(DB_FILE)
+cur = con.cursor()
+
 db_lock = threading.Lock()
 db_queue = LifoQueue()
 stop_event = threading.Event()
@@ -89,27 +93,44 @@ sensor.when_pressed = myCounter
 # =======================
 # DB WRITER THREAD
 # =======================
-def dbWriterThread():
+def sqliteWriterThread():
+    print("SQLite DB writer started")
     global last_db_write
-    print("DB writer started")
+
+    # Connessione locale al thread
+    con_thread = sqlite3.connect(DB_FILE)
+    cur_thread = con_thread.cursor()
 
     while not stop_event.is_set():
-        time.sleep(60)
+        time.sleep(60)  # scrive ogni 60 secondi
         batch = []
+
         while True:
             try:
                 item = db_queue.get_nowait()
                 batch.append(item)
                 db_queue.task_done()
             except Empty:
-                break 
+                break
 
         if batch:
+            # Converte batch di dict in tuple per SQLite
+            sqlite_data = [
+                (row["type"], row["time"], row["data"], row["hour"])
+                for row in batch
+            ]
+
             with db_lock:
-                db.insert_multiple(batch)
+                cur_thread.executemany(
+                    "INSERT INTO Trip (type, time, data, hour) VALUES (?, ?, ?, ?)",
+                    sqlite_data
+                )
+                con_thread.commit()
 
             last_db_write = time.time()
-            print(f"Writed {len(batch)} events into DB")
+            print(f"Wrote {len(batch)} events into SQLite")
+
+    con_thread.close()
             
 # =======================
 # WATCHDOG THREADS
@@ -139,49 +160,74 @@ def dbWatchdog():
 # =======================
 # DB READ FUNCTIONS
 # =======================
+def table_exists(conn, name):
+    try:
+        conn.execute(f"SELECT 1 FROM {name} LIMIT 1")
+        return True
+    except sqlite3.OperationalError:
+        return False
+    
 def getTripsByHour(day, hour):
-    Qry = Query()
     with db_lock:
-        data = db.search(
-            (Qry.data == day) & Qry.hour.test(lambda h: h.startswith(hour))
-        )
+        con_thread = sqlite3.connect(DB_FILE)
+        cur_thread = con_thread.cursor()
+    
+        cur_thread.execute("""
+            SELECT COUNT(*) 
+            FROM Trip
+            WHERE data = ?
+              AND hour LIKE ?
+        """, (day, f"{hour}%"))
+
+        trips = cur_thread.fetchone()[0]
+    
+    con_thread.close()
     return {
-        'trips': len(data),
-        'length': len(data) * tripLength,
+        'trips': trips,
+        'length': trips * tripLength,
         'hour': hour
     }
-
-def getTripsByDay(day):
-    return [getTripsByHour(day, f"{h:02d}") for h in range(24)]
-
+    
 def getTripsByMonth(req, month):
-    Qry = Query()
     with db_lock:
-        t = db.search(Qry.data.test(lambda d: d.startswith(req)))
+        con_thread = sqlite3.connect(DB_FILE)
+        cur_thread = con_thread.cursor()
+        cur_thread.execute("""
+            SELECT COUNT(*)
+            FROM Trip
+            WHERE data LIKE ?
+        """, (f"{req}%",))
+
+        trips = cur_thread.fetchone()[0]
+
+    con_thread.close()
     return {
-        'trips': len(t),
-        'length': len(t) * tripLength,
+        'trips': trips,
+        'length': trips * tripLength,
         'month': month
     }
-
-def getTripsByYear(year):
-    return [
-        getTripsByMonth(year + f"{m:02d}", f"{m:02d}")
-        for m in range(1, 13)
-    ]
-
-def getMaxSpeed(day):
-    Qry = Query()
-    with db_lock:
-        events = db.search(Qry.data == day)
+    
+    
+def getMaxSpeed(day: str) -> dict:
 
     CIRCUMFERENCE_M = tripLength / 100
     N_LAPS = 50
     MAX_SPEED_M_S = 4.0
     MIN_DT = (CIRCUMFERENCE_M * N_LAPS) / MAX_SPEED_M_S
 
-    events.sort(key=lambda e: e["time"])
-    times = [e["time"] for e in events]
+    with db_lock:
+        con_thread = sqlite3.connect(DB_FILE)
+        cur_thread = con_thread.cursor()
+        cur_thread.execute("""
+            SELECT time
+            FROM Trip
+            WHERE data = ?
+            ORDER BY time ASC
+        """, (day,))
+        rows = cur_thread.fetchall()
+
+    # Estrai i tempi come lista di float/int
+    times = [row[0] for row in rows]
 
     results = []
     for i in range(len(times) - N_LAPS):
@@ -200,11 +246,34 @@ def getMaxSpeed(day):
         return {'speed': "", 'speedKM': "", 'deltaT': ""}
 
     best = max(results, key=lambda r: r["speed"])
+    
+    con_thread.close()
     return {
         'speed': f"{best['speed']:.2f} m/s",
         'speedKM': f"({best['speedKM']:.2f} km/h)",
         'deltaT': f"deltaT: {best['deltaT']:.2f} s"
     }
+
+if not table_exists(con, 'Trip'):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS Trip (
+            type TEXT,
+            time REAL,
+            data TEXT,
+            hour TEXT
+        )
+        """)
+    con.commit()
+    
+def getTripsByDay(day):
+    return [getTripsByHour(day, f"{h:02d}") for h in range(24)]
+
+
+def getTripsByYear(year):
+    return [
+        getTripsByMonth(year + f"{m:02d}", f"{m:02d}")
+        for m in range(1, 13)
+    ]
 
 # =======================
 # HTTP API
@@ -279,7 +348,7 @@ def commandThread():
 # =======================
 print("[CTRL + C to end]")
 
-threading.Thread(target=dbWriterThread, daemon=True).start()
+threading.Thread(target=sqliteWriterThread, daemon=True).start()
 threading.Thread(target=serverThread, daemon=True).start()
 threading.Thread(target=commandThread).start()
 threading.Thread(target=gpioWatchdogActive, daemon=True).start()
