@@ -1,5 +1,6 @@
 import time
 import threading
+import base64
 import json
 from queue import LifoQueue
 from queue import Empty
@@ -207,6 +208,44 @@ def getTripsByMonth(req, month):
         'month': month
     }
     
+def getTripsByDays(days: list[str]) -> list[dict]:
+    if not days:
+        return []
+        
+    json_str = base64.b64decode(days).decode('utf-8')
+    dates_array = json.loads(json_str)
+    
+    print(dates_array)
+    
+    placeholders = ",".join(["?"] * len(dates_array))
+    
+    print(placeholders)
+
+    with db_lock:
+        con_thread = sqlite3.connect(DB_FILE)
+        cur_thread = con_thread.cursor()
+        cur_thread.execute(f"""
+            SELECT data, COUNT(*) AS trips
+            FROM Trip
+            WHERE data IN ({placeholders})
+            GROUP BY data
+        """, dates_array)
+        rows = cur_thread.fetchall()
+
+    trips_dict = {row[0]: row[1] for row in rows}
+
+    result = []
+    for d in dates_array:
+        trips = trips_dict.get(d, 0)
+        result.append({
+            'data': d,
+            'trips': trips,
+            'length': trips * tripLength
+        })
+
+    con_thread.close()
+    return result
+    
     
 def getMaxSpeed(day: str) -> dict:
 
@@ -284,7 +323,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
 
         try:
-            if parsed.path == "/getByDay":
+            if parsed.path == "/getByDays":
+                days = params.get("days", [None])[0]
+                if not days:
+                    raise ValueError("Missing 'days' parameter")
+                print(days)
+                result = getTripsByDays(days)
+
+            elif parsed.path == "/getByDay":
                 day = params.get("day", [None])[0]
                 if not day:
                     raise ValueError("Missing 'day' parameter")
