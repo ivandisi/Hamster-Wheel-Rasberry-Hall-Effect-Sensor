@@ -12,9 +12,9 @@
         <h2>Total Daily Trips:</h2>
         <h3>{{ dailyTotalTrips }}</h3>
         <h2>Total distance in km:</h2>
-        <h3>{{ (dailyLength) | number:'1.2-2' }}</h3>
+        <h3>{{ (dailyLength / 10000) | number:'1.2-2' }}</h3>
         <h2>Speed of the day:</h2>
-        <h3>{{ speed.speed }} ({{ speed.speedKM}}) </h3>
+        <h3>{{ speed.speed }} {{ speed.speedKM}} </h3>
         <h2>With trips performed in:</h2>
         <h3>{{ speed.deltaT }}</h3>
     </div>
