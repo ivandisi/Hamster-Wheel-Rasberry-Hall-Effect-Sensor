@@ -79,6 +79,26 @@ Check requirements:
   python3 -c "import tinydb, gpiozero; print('OK')"
 ```
 
+### To run the Angular FE:
+
+Make sure to have nodejs and npm installed
+
+Install Angular cli
+
+```bash
+  npm install -g @angular/cli
+```
+
+To try in local without any CORS error
+
+```bash
+  npm install
+  ng serve --proxy-config proxy.conf.json --host 0.0.0.0
+```
+
+<p align="center" >
+  <img src="https://github.com/ivandisi/Hamster-Wheel-Rasberry-Hall-Effect-Sensor/blob/main/other/angular.png" height="200">
+</p>
 
 ### To run the Android APP:
 
