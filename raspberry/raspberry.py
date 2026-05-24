@@ -30,15 +30,42 @@ WATCHDOG_TIMEOUT = 30
 # GLOBALS
 # =======================
 
-con = sqlite3.connect(DB_FILE)
-cur = con.cursor()
-
 db_lock = threading.Lock()
 db_queue = LifoQueue()
 stop_event = threading.Event()
 
 last_gpio_time = 0
 last_db_write = 0
+
+# =======================
+# DB INIT
+# =======================
+def init_db():
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS Trip (
+            type TEXT,
+            time REAL,
+            data TEXT,
+            hour TEXT
+        )
+    """)
+    # Indici per velocizzare le query più comuni
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trip_data ON Trip(data)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trip_time ON Trip(time)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trip_data_hour ON Trip(data, hour)")
+    con.commit()
+    con.close()
+
+init_db()
+
+# Connessione condivisa per le letture (WAL mode = letture e scritture non si bloccano)
+con_read = sqlite3.connect(DB_FILE, check_same_thread=False)
+con_read.execute("PRAGMA journal_mode=WAL")
+con_read.execute("PRAGMA cache_size=-32000")   # 32MB cache in RAM
+con_read.execute("PRAGMA temp_store=MEMORY")
+con_read.execute("PRAGMA synchronous=NORMAL")
 
 # =======================
 # GPIO
@@ -58,7 +85,6 @@ def myCounter():
 
         try:
             test = db_queue.get_nowait()
-            #print(ts - test['time'])
             if ts - test['time'] < MAX_ONE_IN:
                 print("Removed old, Pistacchio", ts)
                 db_queue.put({
@@ -97,12 +123,12 @@ def sqliteWriterThread():
     print("SQLite DB writer started")
     global last_db_write
 
-    # Connessione locale al thread
     con_thread = sqlite3.connect(DB_FILE)
-    cur_thread = con_thread.cursor()
+    con_thread.execute("PRAGMA journal_mode=WAL")
+    con_thread.execute("PRAGMA synchronous=NORMAL")
 
     while not stop_event.is_set():
-        time.sleep(60)  # scrive ogni 60 secondi
+        time.sleep(60)
         batch = []
 
         while True:
@@ -114,14 +140,13 @@ def sqliteWriterThread():
                 break
 
         if batch:
-            # Converte batch di dict in tuple per SQLite
             sqlite_data = [
                 (row["type"], row["time"], row["data"], row["hour"])
                 for row in batch
             ]
 
             with db_lock:
-                cur_thread.executemany(
+                con_thread.executemany(
                     "INSERT INTO Trip (type, time, data, hour) VALUES (?, ?, ?, ?)",
                     sqlite_data
                 )
@@ -148,7 +173,7 @@ def gpioWatchdogActive():
                 last_gpio_time = time.time()
             except Exception as e:
                 print("❌ Error reset GPIO:", e)
-        time.sleep(1)  # controllo frequente
+        time.sleep(1)
 
 def dbWatchdog():
     while not stop_event.is_set():
@@ -160,28 +185,50 @@ def dbWatchdog():
 # =======================
 # DB READ FUNCTIONS
 # =======================
-def table_exists(conn, name):
+def _reconnect_read():
+    """Ricrea la connessione di lettura con tutti i PRAGMA."""
+    global con_read
+    print("⚠️ Riconnessione DB read...")
     try:
-        conn.execute(f"SELECT 1 FROM {name} LIMIT 1")
+        con_read.close()
+    except Exception:
+        pass
+    con_read = sqlite3.connect(DB_FILE, check_same_thread=False)
+    con_read.execute("PRAGMA journal_mode=WAL")
+    con_read.execute("PRAGMA cache_size=-32000")
+    con_read.execute("PRAGMA temp_store=MEMORY")
+    con_read.execute("PRAGMA synchronous=NORMAL")
+
+def get_read_cursor():
+    """Restituisce un cursore valido, riconnettendo se necessario."""
+    global con_read
+    try:
+        con_read.execute("SELECT 1")
+    except (sqlite3.DatabaseError, sqlite3.OperationalError):
+        _reconnect_read()
+    return con_read.cursor()
+
+def table_exists(name):
+    try:
+        con_read.execute(f"SELECT 1 FROM {name} LIMIT 1")
         return True
     except sqlite3.OperationalError:
         return False
     
 def getTripsByHour(day, hour):
+    # Usa >= e <= invece di LIKE per sfruttare l'indice su (data, hour)
+    hour_start = f"{hour}:00"
+    hour_end   = f"{hour}:59"
     with db_lock:
-        con_thread = sqlite3.connect(DB_FILE)
-        cur_thread = con_thread.cursor()
-    
-        cur_thread.execute("""
+        cur = get_read_cursor()
+        cur.execute("""
             SELECT COUNT(*) 
             FROM Trip
             WHERE data = ?
-              AND hour LIKE ?
-        """, (day, f"{hour}%"))
-
-        trips = cur_thread.fetchone()[0]
-    
-    con_thread.close()
+              AND hour >= ?
+              AND hour <= ?
+        """, (day, hour_start, hour_end))
+        trips = cur.fetchone()[0]
     return {
         'trips': trips,
         'length': trips * tripLength,
@@ -189,18 +236,19 @@ def getTripsByHour(day, hour):
     }
     
 def getTripsByMonth(req, month):
+    # req è tipo "202501" — filtra con >= e <= invece di LIKE
+    year  = req[:4]
+    mon   = req[4:6]
+    start = f"{year}{mon}01"
+    end   = f"{year}{mon}99"
     with db_lock:
-        con_thread = sqlite3.connect(DB_FILE)
-        cur_thread = con_thread.cursor()
-        cur_thread.execute("""
+        cur = get_read_cursor()
+        cur.execute("""
             SELECT COUNT(*)
             FROM Trip
-            WHERE data LIKE ?
-        """, (f"{req}%",))
-
-        trips = cur_thread.fetchone()[0]
-
-    con_thread.close()
+            WHERE data >= ? AND data <= ?
+        """, (start, end))
+        trips = cur.fetchone()[0]
     return {
         'trips': trips,
         'length': trips * tripLength,
@@ -214,57 +262,45 @@ def getTripsByDays(days: list[str]) -> list[dict]:
     json_str = base64.b64decode(days).decode('utf-8')
     dates_array = json.loads(json_str)
     
-    print(dates_array)
-    
     placeholders = ",".join(["?"] * len(dates_array))
-    
-    print(placeholders)
 
     with db_lock:
-        con_thread = sqlite3.connect(DB_FILE)
-        cur_thread = con_thread.cursor()
-        cur_thread.execute(f"""
+        cur = get_read_cursor()
+        cur.execute(f"""
             SELECT data, COUNT(*) AS trips
             FROM Trip
             WHERE data IN ({placeholders})
             GROUP BY data
         """, dates_array)
-        rows = cur_thread.fetchall()
+        rows = cur.fetchall()
 
     trips_dict = {row[0]: row[1] for row in rows}
 
-    result = []
-    for d in dates_array:
-        trips = trips_dict.get(d, 0)
-        result.append({
+    return [
+        {
             'data': d,
-            'trips': trips,
-            'length': trips * tripLength
-        })
-
-    con_thread.close()
-    return result
-    
+            'trips': trips_dict.get(d, 0),
+            'length': trips_dict.get(d, 0) * tripLength
+        }
+        for d in dates_array
+    ]
     
 def getMaxSpeed(day: str) -> dict:
-
     CIRCUMFERENCE_M = tripLength / 100
     N_LAPS = 50
     MAX_SPEED_M_S = 4.0
     MIN_DT = (CIRCUMFERENCE_M * N_LAPS) / MAX_SPEED_M_S
 
     with db_lock:
-        con_thread = sqlite3.connect(DB_FILE)
-        cur_thread = con_thread.cursor()
-        cur_thread.execute("""
+        cur = get_read_cursor()
+        cur.execute("""
             SELECT time
             FROM Trip
             WHERE data = ?
             ORDER BY time ASC
         """, (day,))
-        rows = cur_thread.fetchall()
+        rows = cur.fetchall()
 
-    # Estrai i tempi come lista di float/int
     times = [row[0] for row in rows]
 
     results = []
@@ -272,7 +308,6 @@ def getMaxSpeed(day: str) -> dict:
         dt = times[i + N_LAPS] - times[i]
         if dt < MIN_DT:
             continue
-
         speed = (CIRCUMFERENCE_M * N_LAPS) / dt
         results.append({
             "speed": speed,
@@ -284,28 +319,32 @@ def getMaxSpeed(day: str) -> dict:
         return {'speed': "", 'speedKM': "", 'deltaT': ""}
 
     best = max(results, key=lambda r: r["speed"])
-    
-    con_thread.close()
     return {
         'speed': f"{best['speed']:.2f} m/s",
         'speedKM': f"({best['speedKM']:.2f} km/h)",
         'deltaT': f"deltaT: {best['deltaT']:.2f} s"
     }
 
-if not table_exists(con, 'Trip'):
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS Trip (
-            type TEXT,
-            time REAL,
-            data TEXT,
-            hour TEXT
-        )
-        """)
-    con.commit()
-    
 def getTripsByDay(day):
-    return [getTripsByHour(day, f"{h:02d}") for h in range(24)]
+    # Una sola query invece di 24 separate
+    with db_lock:
+        cur = get_read_cursor()
+        cur.execute("""
+            SELECT SUBSTR(hour, 1, 2) as h, COUNT(*)
+            FROM Trip
+            WHERE data = ?
+            GROUP BY h
+        """, (day,))
+        rows = dict(cur.fetchall())
 
+    return [
+        {
+            'trips': rows.get(f"{h:02d}", 0),
+            'length': rows.get(f"{h:02d}", 0) * tripLength,
+            'hour': f"{h:02d}"
+        }
+        for h in range(24)
+    ]
 
 def getTripsByYear(year):
     return [
@@ -379,13 +418,10 @@ def commandThread():
             cmd = input("Command: ").strip()
             if cmd == "q":
                 stop_event.set()
-            elif cmd == "a":
-                with db_lock:
-                    print(db.all())
             elif cmd == "t":
                 myCounter()
             time.sleep(0.3)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         stop_event.set()
 
 # =======================
@@ -404,4 +440,5 @@ try:
 except KeyboardInterrupt:
     stop_event.set()
 finally:
+    con_read.close()
     print("Script ended")
