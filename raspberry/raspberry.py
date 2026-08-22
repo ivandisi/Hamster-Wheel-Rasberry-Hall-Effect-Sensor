@@ -10,6 +10,7 @@ from urllib.parse import urlparse, parse_qs
 from gpiozero import Button
 from signal import pause
 import sqlite3
+import logging
 
 # =======================
 # CONFIG
@@ -30,6 +31,13 @@ WATCHDOG_TIMEOUT = 30
 # GLOBALS
 # =======================
 
+logger = logging.getLogger("pistacchio")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+gpio_lock = threading.Lock()
 db_lock = threading.Lock()
 db_queue = LifoQueue()
 stop_event = threading.Event()
@@ -74,45 +82,56 @@ sensor = Button(Digital_PIN, pull_up=True)
 
 def myCounter():
     global last_gpio_time
+
     try:
-        ts = time.time()
-        
-        if ts - last_gpio_time < MIN_TRIP_DT:
-            return
-        last_gpio_time = ts
+        with gpio_lock:
+            ts = time.time()
 
-        data = datetime.fromtimestamp(ts)
+            if ts - last_gpio_time < MIN_TRIP_DT:
+                return
 
-        try:
-            test = db_queue.get_nowait()
-            if ts - test['time'] < MAX_ONE_IN:
-                print("Removed old, Pistacchio", ts)
+            last_gpio_time = ts
+
+            data = datetime.fromtimestamp(ts)
+
+            try:
+                test = db_queue.get_nowait()
+
+                if ts - test['time'] < MAX_ONE_IN:
+                    print("Removed old, Pistacchio", ts)
+
+                    db_queue.put({
+                        'type': 'trip',
+                        'time': ts,
+                        'data': data.strftime("%Y%m%d"),
+                        'hour': data.strftime("%H:%M")
+                    })
+
+                else:
+                    db_queue.put(test)
+
+                    print("Pistacchio", ts)
+
+                    db_queue.put({
+                        'type': 'trip',
+                        'time': ts,
+                        'data': data.strftime("%Y%m%d"),
+                        'hour': data.strftime("%H:%M")
+                    })
+
+            except Empty:
+                print("Empty, Pistacchio", ts)
+
                 db_queue.put({
                     'type': 'trip',
                     'time': ts,
                     'data': data.strftime("%Y%m%d"),
                     'hour': data.strftime("%H:%M")
                 })
-            else:
-                db_queue.put(test)
-                print("Pistacchio", ts)
-                db_queue.put({
-                    'type': 'trip',
-                    'time': ts,
-                    'data': data.strftime("%Y%m%d"),
-                    'hour': data.strftime("%H:%M")
-                })
-        except Empty:
-            print("Empty, Pistacchio", ts)
-            db_queue.put({
-                'type': 'trip',
-                'time': ts,
-                'data': data.strftime("%Y%m%d"),
-                'hour': data.strftime("%H:%M")
-            })
-        
-    except Exception as e:
-        print("ERRORE GPIO:", e)
+
+    except Exception:
+        logger.exception("ERRORE durante la gestione dell'evento GPIO")
+
 
 sensor.when_pressed = myCounter
 
@@ -160,20 +179,34 @@ def sqliteWriterThread():
 # =======================
 # WATCHDOG THREADS
 # =======================
+
 def gpioWatchdogActive():
     global sensor, last_gpio_time
+
     while not stop_event.is_set():
         delta = time.time() - last_gpio_time
+
         if delta > WATCHDOG_TIMEOUT:
             try:
-                sensor.close()
-                time.sleep(0.1)
-                sensor = Button(Digital_PIN, pull_up=True)
-                sensor.when_pressed = myCounter
-                last_gpio_time = time.time()
-            except Exception as e:
-                print("❌ Error reset GPIO:", e)
+                with gpio_lock:
+                    logger.warning(
+                        "WATCHDOG GPIO: nessun evento da %.1f secondi, reset sensore",
+                        delta
+                    )
+
+                    sensor.close()
+                    time.sleep(0.1)
+
+                    sensor = Button(Digital_PIN, pull_up=True)
+                    sensor.when_pressed = myCounter
+
+                    last_gpio_time = time.time()
+
+            except Exception:
+                logger.exception("ERRORE durante il reset del GPIO")
+
         time.sleep(1)
+        
 
 def dbWatchdog():
     while not stop_event.is_set():
