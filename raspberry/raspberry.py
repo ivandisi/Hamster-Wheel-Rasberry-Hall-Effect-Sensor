@@ -2,15 +2,14 @@ import time
 import threading
 import base64
 import json
-from queue import LifoQueue
+from queue import Queue
 from queue import Empty
 from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-from gpiozero import Button
+from gpiozero import DigitalInputDevice
 from signal import pause
 import sqlite3
-import logging
 
 # =======================
 # CONFIG
@@ -20,30 +19,32 @@ DB_FILE = "pistacchio.db"
 tripLength = 88
 # Sensor PIN
 Digital_PIN = 22
-# Debouncing time 10ms
-MIN_TRIP_DT = 0.01 
+# Debouncing time 10ms (delegato al pin factory via bounce_time)
+MIN_TRIP_DT = 0.01
 # High level filter, max 1 trip in 200ms on a 28cm diameter wheel (realistic max hamster speed)
 MAX_ONE_IN = 0.2
-# Watchdog
-WATCHDOG_TIMEOUT = 30 
+# Ricostruzione periodica del sensore
+WATCHDOG_TIMEOUT = 60
+# Pausa fra detach della callback e close(): lascia esaurire i callback in volo
+GPIO_DETACH_SETTLE = 0.02
+# Intervallo di flush del writer SQLite
+DB_FLUSH_INTERVAL = 60
 
 # =======================
 # GLOBALS
 # =======================
 
-logger = logging.getLogger("pistacchio")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-gpio_lock = threading.Lock()
 db_lock = threading.Lock()
-db_queue = LifoQueue()
+db_queue = Queue()
 stop_event = threading.Event()
 
-last_gpio_time = 0
+gpio_lock = threading.RLock()
+
+last_gpio_time = time.time()
+last_accepted_ts = 0.0
 last_db_write = 0
+
+sensor = None
 
 # =======================
 # DB INIT
@@ -78,66 +79,101 @@ con_read.execute("PRAGMA synchronous=NORMAL")
 # =======================
 # GPIO
 # =======================
-sensor = Button(Digital_PIN, pull_up=True)
-
 def myCounter():
-    global last_gpio_time
-
+    global last_gpio_time, last_accepted_ts
     try:
-        with gpio_lock:
-            ts = time.time()
+        ts = time.time()
+        last_gpio_time = ts
 
-            if ts - last_gpio_time < MIN_TRIP_DT:
-                return
+        # Filtro di alto livello: scarta i fronti troppo ravvicinati per
+        # essere giri reali della ruota. Sostituisce la vecchia logica
+        # basata sulla LifoQueue, che poteva perdere il campione di
+        # confronto se il writer svuotava la coda nel frattempo.
+        if ts - last_accepted_ts < MAX_ONE_IN:
+            return
+        last_accepted_ts = ts
 
-            last_gpio_time = ts
+        data = datetime.fromtimestamp(ts)
+        db_queue.put({
+            'type': 'trip',
+            'time': ts,
+            'data': data.strftime("%Y%m%d"),
+            'hour': data.strftime("%H:%M")
+        })
+        print("Pistacchio", ts)
 
-            data = datetime.fromtimestamp(ts)
+    except Exception as e:
+        print("ERRORE GPIO:", e)
 
+
+def _make_sensor():
+    dev = DigitalInputDevice(Digital_PIN, pull_up=True, bounce_time=MIN_TRIP_DT)
+    dev.when_activated = myCounter
+    return dev
+
+
+def rebuildSensor(reason=""):
+    global sensor, last_gpio_time
+    with gpio_lock:
+        old = sensor
+        if old is not None:
             try:
-                test = db_queue.get_nowait()
+                old.pin.when_changed = None
+            except Exception:
+                pass
+            time.sleep(GPIO_DETACH_SETTLE)
+            try:
+                old.close()
+            except Exception as e:
+                print("⚠️ close() sensore:", e)
 
-                if ts - test['time'] < MAX_ONE_IN:
-                    print("Removed old, Pistacchio", ts)
-
-                    db_queue.put({
-                        'type': 'trip',
-                        'time': ts,
-                        'data': data.strftime("%Y%m%d"),
-                        'hour': data.strftime("%H:%M")
-                    })
-
-                else:
-                    db_queue.put(test)
-
-                    print("Pistacchio", ts)
-
-                    db_queue.put({
-                        'type': 'trip',
-                        'time': ts,
-                        'data': data.strftime("%Y%m%d"),
-                        'hour': data.strftime("%H:%M")
-                    })
-
-            except Empty:
-                print("Empty, Pistacchio", ts)
-
-                db_queue.put({
-                    'type': 'trip',
-                    'time': ts,
-                    'data': data.strftime("%Y%m%d"),
-                    'hour': data.strftime("%H:%M")
-                })
-
-    except Exception:
-        logger.exception("ERRORE durante la gestione dell'evento GPIO")
+        try:
+            sensor = _make_sensor()
+            last_gpio_time = time.time()
+            print(f"✅ GPIO ricreato ({reason})", time.time())
+        except Exception as e:
+            sensor = None
+            print("❌ Impossibile ricreare il GPIO:", e)
 
 
-sensor.when_pressed = myCounter
+with gpio_lock:
+    sensor = _make_sensor()
+
+
+def _thread_excepthook(args):
+    print(f"❌ Eccezione in {args.thread.name}: "
+          f"{args.exc_type.__name__}: {args.exc_value}")
+
+    files = []
+    tb = args.exc_traceback
+    while tb:
+        files.append(tb.tb_frame.f_code.co_filename)
+        tb = tb.tb_next
+
+    if any(("lgpio" in f or "gpiozero" in f) for f in files):
+        threading.Thread(
+            target=rebuildSensor,
+            args=("crash thread GPIO",),
+            daemon=True
+        ).start()
+
+threading.excepthook = _thread_excepthook
 
 # =======================
 # DB WRITER THREAD
 # =======================
+def _drain_queue():
+    batch = []
+    while True:
+        try:
+            item = db_queue.get_nowait()
+            batch.append(item)
+            db_queue.task_done()
+        except Empty:
+            break
+    return batch
+
+
 def sqliteWriterThread():
     print("SQLite DB writer started")
     global last_db_write
@@ -146,80 +182,64 @@ def sqliteWriterThread():
     con_thread.execute("PRAGMA journal_mode=WAL")
     con_thread.execute("PRAGMA synchronous=NORMAL")
 
-    while not stop_event.is_set():
-        time.sleep(60)
-        batch = []
+    def flush():
+        global last_db_write
+        batch = _drain_queue()
+        if not batch:
+            return
+        sqlite_data = [
+            (row["type"], row["time"], row["data"], row["hour"])
+            for row in batch
+        ]
+        with db_lock:
+            con_thread.executemany(
+                "INSERT INTO Trip (type, time, data, hour) VALUES (?, ?, ?, ?)",
+                sqlite_data
+            )
+            con_thread.commit()
+        last_db_write = time.time()
+        print(f"Wrote {len(batch)} events into SQLite")
 
-        while True:
-            try:
-                item = db_queue.get_nowait()
-                batch.append(item)
-                db_queue.task_done()
-            except Empty:
-                break
+    while not stop_event.wait(timeout=DB_FLUSH_INTERVAL):
+        try:
+            flush()
+        except Exception as e:
+            print("❌ Errore scrittura SQLite:", e)
 
-        if batch:
-            sqlite_data = [
-                (row["type"], row["time"], row["data"], row["hour"])
-                for row in batch
-            ]
-
-            with db_lock:
-                con_thread.executemany(
-                    "INSERT INTO Trip (type, time, data, hour) VALUES (?, ?, ?, ?)",
-                    sqlite_data
-                )
-                con_thread.commit()
-
-            last_db_write = time.time()
-            print(f"Wrote {len(batch)} events into SQLite")
+    # Flush finale: non perdere l'ultimo minuto di eventi allo shutdown
+    try:
+        flush()
+    except Exception as e:
+        print("❌ Errore flush finale:", e)
 
     con_thread.close()
-            
+    print("SQLite DB writer stopped")
+
 # =======================
 # WATCHDOG THREADS
 # =======================
-
 def gpioWatchdogActive():
-    global sensor, last_gpio_time
-
     while not stop_event.is_set():
-        delta = time.time() - last_gpio_time
+        remaining = WATCHDOG_TIMEOUT - (time.time() - last_gpio_time)
+        if remaining > 0:
+            # ricontrolla al massimo ogni 5s: last_gpio_time può
+            # essere aggiornato dalla callback nel frattempo
+            if stop_event.wait(timeout=min(remaining, 5)):
+                break
+            continue
+        rebuildSensor("idle 60s")
 
-        if delta > WATCHDOG_TIMEOUT:
-            try:
-                with gpio_lock:
-                    logger.warning(
-                        "WATCHDOG GPIO: nessun evento da %.1f secondi, reset sensore",
-                        delta
-                    )
-
-                    sensor.close()
-                    time.sleep(0.1)
-
-                    sensor = Button(Digital_PIN, pull_up=True)
-                    sensor.when_pressed = myCounter
-
-                    last_gpio_time = time.time()
-
-            except Exception:
-                logger.exception("ERRORE durante il reset del GPIO")
-
-        time.sleep(1)
-        
 
 def dbWatchdog():
-    while not stop_event.is_set():
+    while not stop_event.wait(timeout=5):
         qsize = db_queue.qsize()
         if qsize > 100:
             print(f"⚠️ WATCHDOG DB: queue length = {qsize}")
-        time.sleep(5)
 
 # =======================
 # DB READ FUNCTIONS
 # =======================
 def _reconnect_read():
-    """Ricrea la connessione di lettura con tutti i PRAGMA."""
     global con_read
     print("⚠️ Riconnessione DB read...")
     try:
@@ -247,7 +267,7 @@ def table_exists(name):
         return True
     except sqlite3.OperationalError:
         return False
-    
+
 def getTripsByHour(day, hour):
     # Usa >= e <= invece di LIKE per sfruttare l'indice su (data, hour)
     hour_start = f"{hour}:00"
@@ -255,7 +275,7 @@ def getTripsByHour(day, hour):
     with db_lock:
         cur = get_read_cursor()
         cur.execute("""
-            SELECT COUNT(*) 
+            SELECT COUNT(*)
             FROM Trip
             WHERE data = ?
               AND hour >= ?
@@ -267,7 +287,7 @@ def getTripsByHour(day, hour):
         'length': trips * tripLength,
         'hour': hour
     }
-    
+
 def getTripsByMonth(req, month):
     # req è tipo "202501" — filtra con >= e <= invece di LIKE
     year  = req[:4]
@@ -287,14 +307,17 @@ def getTripsByMonth(req, month):
         'length': trips * tripLength,
         'month': month
     }
-    
-def getTripsByDays(days: list[str]) -> list[dict]:
+
+def getTripsByDays(days: str) -> list[dict]:
     if not days:
         return []
-        
+
     json_str = base64.b64decode(days).decode('utf-8')
     dates_array = json.loads(json_str)
-    
+
+    if not dates_array:
+        return []
+
     placeholders = ",".join(["?"] * len(dates_array))
 
     with db_lock:
@@ -317,7 +340,7 @@ def getTripsByDays(days: list[str]) -> list[dict]:
         }
         for d in dates_array
     ]
-    
+
 def getMaxSpeed(day: str) -> dict:
     CIRCUMFERENCE_M = tripLength / 100
     N_LAPS = 50
@@ -398,7 +421,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                 days = params.get("days", [None])[0]
                 if not days:
                     raise ValueError("Missing 'days' parameter")
-                print(days)
                 result = getTripsByDays(days)
 
             elif parsed.path == "/getByDay":
@@ -418,6 +440,22 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not day:
                     raise ValueError("Missing 'day' parameter")
                 result = getMaxSpeed(day)
+
+            elif parsed.path == "/health":
+                with gpio_lock:
+                    sensor_ok = sensor is not None
+                    try:
+                        pin_value = sensor.value if sensor_ok else None
+                    except Exception:
+                        pin_value = None
+                        sensor_ok = False
+                result = {
+                    'sensor': sensor_ok,
+                    'pin_value': pin_value,
+                    'queue': db_queue.qsize(),
+                    'last_gpio_time': last_gpio_time,
+                    'last_db_write': last_db_write
+                }
 
             else:
                 self.send_response(404)
@@ -440,10 +478,13 @@ class ApiHandler(BaseHTTPRequestHandler):
 # =======================
 # THREADS
 # =======================
+http_server = None
+
 def serverThread():
-    server = ThreadingHTTPServer(("0.0.0.0", 8000), ApiHandler)
+    global http_server
+    http_server = ThreadingHTTPServer(("0.0.0.0", 8000), ApiHandler)
     print("Server HTTP started on :8000")
-    server.serve_forever()
+    http_server.serve_forever()
 
 def commandThread():
     try:
@@ -453,6 +494,8 @@ def commandThread():
                 stop_event.set()
             elif cmd == "t":
                 myCounter()
+            elif cmd == "r":
+                rebuildSensor("manuale")
             time.sleep(0.3)
     except (KeyboardInterrupt, EOFError):
         stop_event.set()
@@ -462,16 +505,45 @@ def commandThread():
 # =======================
 print("[CTRL + C to end]")
 
-threading.Thread(target=sqliteWriterThread, daemon=True).start()
+writer = threading.Thread(target=sqliteWriterThread)
+writer.start()
 threading.Thread(target=serverThread, daemon=True).start()
-threading.Thread(target=commandThread).start()
+threading.Thread(target=commandThread, daemon=True).start()
 threading.Thread(target=gpioWatchdogActive, daemon=True).start()
 threading.Thread(target=dbWatchdog, daemon=True).start()
 
 try:
-    pause()
+    while not stop_event.wait(timeout=1):
+        pass
 except KeyboardInterrupt:
     stop_event.set()
 finally:
-    con_read.close()
+    stop_event.set()
+
+    # Attende il flush finale del writer prima di chiudere tutto
+    writer.join(timeout=10)
+
+    with gpio_lock:
+        if sensor is not None:
+            try:
+                sensor.pin.when_changed = None
+            except Exception:
+                pass
+            time.sleep(GPIO_DETACH_SETTLE)
+            try:
+                sensor.close()
+            except Exception:
+                pass
+
+    if http_server is not None:
+        try:
+            http_server.shutdown()
+        except Exception:
+            pass
+
+    try:
+        con_read.close()
+    except Exception:
+        pass
+
     print("Script ended")
